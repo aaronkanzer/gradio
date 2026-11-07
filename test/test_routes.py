@@ -3596,6 +3596,42 @@ class TestOAuthSecurity:
             "_nb_redirects=4&_target_url=%2Fapp"
         )
 
+    def test_session_cookie_is_partitioned_for_iframe_embeds(self, monkeypatch):
+        """A Space is served from <user>-<space>.hf.space but embedded in an iframe
+        on huggingface.co, so its session cookie is third-party. Without
+        `Partitioned`, a browser that restricts third-party cookies drops it and the
+        user never appears logged in."""
+        if not oauth._session_cookie_can_be_partitioned():
+            pytest.skip("installed starlette predates partitioned session cookies")
+
+        monkeypatch.setattr(oauth, "_add_mocked_oauth_routes", lambda app: None)
+        app = FastAPI()
+        oauth.attach_oauth(app)
+
+        session_mw = next(
+            mw for mw in app.user_middleware if mw.cls is SessionMiddleware
+        )
+        assert session_mw.kwargs["same_site"] == "none"
+        assert session_mw.kwargs["https_only"] is True
+        assert session_mw.kwargs["partitioned"] is True
+
+    def test_stale_session_cookie_expiry_matches_partitioned_attribute(self):
+        """A cookie set with `Partitioned` is a different cookie from an
+        unpartitioned one of the same name, so clearing stale OAuth state has to
+        target both variants."""
+        response = RedirectResponse("/login/huggingface")
+        oauth._expire_session_cookie(response)
+        cookies = [v.decode() for k, v in response.raw_headers if k == b"set-cookie"]
+
+        assert cookies
+        assert all('session=""' in c and "Max-Age=0" in c for c in cookies)
+        if oauth._session_cookie_can_be_partitioned():
+            assert len(cookies) == 2
+            assert sum("Partitioned" in c for c in cookies) == 1
+        else:
+            assert len(cookies) == 1
+            assert "Partitioned" not in cookies[0]
+
     def test_mismatching_oauth_state_preserves_existing_login(self, monkeypatch):
         oauth_info = {"access_token": "valid"}
 

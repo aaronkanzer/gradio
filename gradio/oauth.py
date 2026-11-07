@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import functools
 import hashlib
+import inspect
 import os
 import time
 import typing
@@ -20,6 +22,37 @@ OAUTH_SCOPES = os.environ.get("OAUTH_SCOPES")
 OPENID_PROVIDER_URL = os.environ.get("OPENID_PROVIDER_URL")
 
 MAX_REDIRECTS = 2
+
+
+@functools.lru_cache(maxsize=1)
+def _session_cookie_can_be_partitioned() -> bool:
+    """Whether the installed Starlette can set a `Partitioned` session cookie.
+
+    `partitioned` was added to `SessionMiddleware` in Starlette 1.7.0, while
+    gradio still allows `starlette>=1.0.1`, so this is detected rather than
+    assumed.
+    """
+    from starlette.middleware.sessions import SessionMiddleware
+
+    return "partitioned" in inspect.signature(SessionMiddleware.__init__).parameters
+
+
+def _expire_session_cookie(response: RedirectResponse) -> None:
+    """Expire the session cookie, including its partitioned variant.
+
+    A cookie set with `Partitioned` is a *different* cookie from an
+    unpartitioned one of the same name, so clearing stale state has to target
+    both. `Response.delete_cookie(partitioned=...)` is Python 3.14+ only, so
+    the header is written directly to keep working on every version gradio
+    supports.
+    """
+    expired = (
+        'session=""; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0;'
+        " HttpOnly; Secure; SameSite=none"
+    )
+    response.headers.append("set-cookie", expired)
+    if _session_cookie_can_be_partitioned():
+        response.headers.append("set-cookie", expired + "; Partitioned")
 
 
 def attach_oauth(app: fastapi.FastAPI):
@@ -46,12 +79,20 @@ def attach_oauth(app: fastapi.FastAPI):
     session_secret = (OAUTH_CLIENT_SECRET or "") + "-v4"
     # ^ if we change the session cookie format in the future, we can bump the version of the session secret to make
     #   sure cookies are invalidated. Otherwise some users with an old cookie format might get a HTTP 500 error.
-    app.add_middleware(
-        SessionMiddleware,  # type: ignore
-        secret_key=hashlib.sha256(session_secret.encode()).hexdigest(),
-        same_site="none",
-        https_only=True,
-    )
+    # A Space is served from <user>-<space>.hf.space but embedded in an iframe on
+    # huggingface.co, so this is a third-party cookie. `SameSite=none` alone is not
+    # enough: a browser that restricts third-party cookies drops it, the Space never
+    # sees a session, and the user gets a login button that never flips or a redirect
+    # loop. `Partitioned` (CHIPS) keeps it in a jar keyed by the embedding site, which
+    # is what lets the session survive inside the Hub iframe.
+    session_kwargs: dict[str, typing.Any] = {
+        "secret_key": hashlib.sha256(session_secret.encode()).hexdigest(),
+        "same_site": "none",
+        "https_only": True,
+    }
+    if _session_cookie_can_be_partitioned():
+        session_kwargs["partitioned"] = True
+    app.add_middleware(SessionMiddleware, **session_kwargs)  # type: ignore
 
 
 def _add_oauth_routes(app: fastapi.FastAPI) -> None:
@@ -149,9 +190,7 @@ def _add_oauth_routes(app: fastapi.FastAPI) -> None:
                 response = RedirectResponse(login_uri)
 
             if stale_cookie:
-                response.delete_cookie(
-                    "session", secure=True, httponly=True, samesite="none"
-                )
+                _expire_session_cookie(response)
             return response
 
         # OAuth login worked => store the user info in the session and redirect
